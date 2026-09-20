@@ -1,0 +1,78 @@
+# FINAL_MODEL_CONFIG_v2.yaml -- frozen proposed detector for the v2 (curve-preserving attack) benchmark. ROUND 2 (E5 PF-Fusion).
+# Selected by the pre-registered rule in results/v2/ENHANCEMENT_PROTOCOL.md (Round 2 section, written before Round-2 runs):
+# E5 replaced the Round-1 model (E4) because S(E5) = 0.8305 > S(E4) + 0.005 = 0.8271.
+# The previous (Round-1) config is preserved in FINAL_MODEL_CONFIG_v2_round1.yaml.
+# The test splits (test_full, test_n200) of v2 were NEVER loaded or inspected during development, in either round
+# (src/v2/enh_data.py and baselines_lib.load_trainval read only train__/val__/meta__ keys and raise for any other split).
+# Caveat: two development rounds used the same validation split, so val numbers are optimistic; only the one-time test evaluation is unbiased.
+
+selected_architecture:
+  name: E5 PF-Fusion
+  full_name: "Probability-level fusion of a noise-augmented physics-feature XGBoost and the E4 MSC-MIL-Long network"
+  implementation: "src/v2/enhanced_model.py: FROZEN_CFG, train_frozen(train, val, meta, seed, device), predict_proba(model, split, device), FusedDetector, fit_frozen_tree, tree_features"
+  fusion: "p = w_tree * p_xgb + (1 - w_tree) * p_net ; alert if p >= 0.5"
+  w_tree: 0.2                   # fusion weight, tuned on SCMA-1 validation (seed 0) over the grid {0,0.05,...,1} maximising S_T -- a model-selection use of val
+  alert_threshold: 0.5
+  components: [network (E4 MSC-MIL-Long), tree (XGBoost with 15 physics-augmented features)]
+  n_params: {network: 205057, tree_node_bound: 44800, total: 249857}   # tree bound = n_estimators * 2^max_depth
+  latency_ms_batch1: {gpu: 3.0, cpu: 5.2}     # SCMA-1 seed 0 measurement, network + features + tree
+
+network:                     # identical to Round 1's frozen E4
+  base_model: "src/candidates/msc_mil.py MSCMIL via src/v2/enhanced_model.py EnhancedMSCMIL(physics=False)"
+  input_dim: 3
+  encoder_hidden: 64
+  encoder_out: 64
+  lstm_hidden_per_dir: 64
+  static_dim: 4
+  static_hidden: 32
+  pooling_scales_slots_per_token: [1, 3, 12]
+  dropout: 0.2607637796221153
+  supcon_beta: 0.13088807147306578
+  supcon_temperature: 0.13083402373105277
+  learning_rate: 0.0029022182175632034
+  l2_reg: 0.0001
+  batch_size: 32
+  optimizer: Adam (weight_decay 0; L2 applied in the loss)
+  lr_schedule: "CosineAnnealingLR(T_max=60 epochs, eta_min=1% of lr), stepped per epoch"
+  max_epochs: 60
+  early_stopping_patience: 12
+  early_stopping_metric: "val score = 0.5*clean macro-F1@0.5 + 0.5*mean macro-F1@0.5 under legacy noise 5/15/30% (fixed draws, RNG seed = int(level*1000)*100 + seed + 1000); best epoch restored"
+  augmentation: "per batch/bag: r~U(0,0.3): Gaussian noise std r*TRAIN_std on active-slot scaled power and scaled static energy; q~U(0,0.25): each active slot masked w.p. q"
+  loss: "BCE_with_logits + l2_reg*sum(p^2) + supcon_beta*SupCon(fused H, labels, supcon_temperature)"
+  per_seed_instruction: "torch.manual_seed(seed); numpy seed(seed); train_enhanced(FROZEN_NET_CFG, train, val, meta, seed, device) -- equivalently src.v2.enhanced_model.train_frozen"
+
+tree:
+  model: "xgboost.XGBClassifier(eval_metric='logloss', random_state=seed, n_jobs=8, tree_method='hist', scale_pos_weight=(n_neg/n_pos of the augmented training set), **params)"
+  params: {n_estimators: 350, max_depth: 7, learning_rate: 0.0815241575370242, subsample: 0.9718740392573121, colsample_bytree: 0.8409101495517417, reg_lambda: 0.11981845126013872, min_child_weight: 5}
+  tuning: "Optuna TPE seed 0, 15 trials, baselines_lib.suggest_tree space, objective clean val macro-F1@0.5 on SCMA-1 seed 0 (tuning val F1 0.8627); chosen as best of the four PF trees by SCMA-1 clean val macro-F1 (XGBoost-PF 0.8610, LightGBM-PF 0.8556, CatBoost-PF 0.8550, RandomForest-PF 0.8361, mean of seeds 0-2)"
+  features: "15 dims = src.v2.common.summary_features (7: e_demand, t_avail, conn-hour proxy, t_end, active-power mean/std/max, TRAIN-scaled) + 8 physics features (enhanced_model.physics_features: energy residual, log peak/mean, load factor, soft 20 kW clip fraction, log window hours, window/t_avail, plateau fraction, log(1+CV)) computed from the passed (possibly noisy) tensors"
+  training_set: "clean TRAIN + 4 augmented copies (augment_batch with noise_max 0.3, drop_max 0.25, CPU torch.Generator().manual_seed(seed)); labels tiled"
+  per_seed_instruction: "fit_frozen_tree(train, meta, seed) -- equivalently src.v2.enhanced_model.train_frozen"
+
+seeds:
+  final_evaluation_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]   # same seed drives network init/shuffle/augmentation and the tree's augmentation + XGBoost random_state
+  selection_seeds_used: [0, 1, 2]
+
+data:
+  builder: "src/v2/dataset_v2.py build_type_dataset_v2(scma_type) (cached data/processed_v2/scma{t}_v2.npz)"
+  scalers_meta: "meta__power_mean/power_scale/static_mean/static_scale from the cache (train-benign scalers); pass as `meta` (dict of arrays)"
+  attack_sampling_seeds: {val: 20260101, test_n200: 20260102, test_full: 20260103}
+  train_variants: "9 per source (variant 0 policy-mean C, 1..8 stochastic, seed 71000)"
+  development_types: [1, 4]      # selection on SCMA-1 and SCMA-4; SCMA-2 clean/noisy reported for information
+  splits_used_in_development: [train, val]
+  test_split_read_during_development: false
+
+selection_evidence:   # validation, seeds 0-2
+  S_mean_SCMA1_SCMA4: {E5_PF_fusion: 0.8305, E4: 0.8221, E3: 0.8177, MSC_MIL_original: 0.8133, E1: 0.8101, E2: 0.8057}
+  replacement_rule: "E5 replaces E4 only if S > 0.8221 + 0.005; 0.8305 > 0.8271 (S difference 0.0084 > 0.005 tie band)"
+  tables: results/v2/ENHANCEMENT_REPORT.md
+  protocol: results/v2/ENHANCEMENT_PROTOCOL.md
+  caveat: >
+    S weights legacy noise (additive, 5-30% of the TRAIN feature std) at 50%, which strongly penalises trees (they collapse under it) and is
+    much larger than the measured sensor noise (sigma_r ~ 0.23%, NOISE_CALIBRATION.md). Under clean and calibrated noise the stand-alone
+    physics-feature trees score higher than E5 on SCMA-2 and SCMA-4 (see BASELINES_TUNING_REPORT.md addendum and ENHANCEMENT_REPORT.md Round 2).
+
+usage: |
+  from src.v2 import enhanced_model as em
+  r = em.train_frozen(train, val, meta, seed, device)       # trains network + tree for this seed
+  p = em.predict_proba(r["model"], split, device)            # fused probability; alert if p >= 0.5
